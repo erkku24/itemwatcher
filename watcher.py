@@ -561,6 +561,4 @@ def main():
 
 
 if __name__ == "__main__":
-    send_email({
-        "https://www.prisma.fi/": "TESTI – Prisma Pokémon watcher"
-    })
+    main()
