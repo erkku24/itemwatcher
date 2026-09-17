@@ -1,793 +1,564 @@
+import json
 import os
-import re
-import sqlite3
 import smtplib
-import ssl
-import time
-
 from email.message import EmailMessage
-from urllib.parse import urljoin, urlparse, parse_qs
+from pathlib import Path
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
-import requests
-from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
 
-
-# ============================================================
-# ASETUKSET
-# ============================================================
 
 BASE_URL = "https://www.prisma.fi"
+POKEMON_BRAND_URL = "https://www.prisma.fi/tuotemerkit/pokemon"
 
-# Näitä seurataan.
-POKEMON_BRAND_URL = (
-    "https://www.prisma.fi/tuotemerkit/pokemon"
-)
+SEARCH_TERM = "pokemon"
 
-POKEMON_TCG_URL = (
-    "https://www.prisma.fi/tuotemerkit/pokemon-tcg"
-)
+KNOWN_PRODUCTS_FILE = Path("known_products.json")
 
-NEW_PRODUCTS_URL = (
-    "https://www.prisma.fi/kategoriat/2047/uutuudet"
-)
-
-# Hakusanoja, jotka tekevät tuotteesta kiinnostavan.
-KEYWORDS = [
-    "pokemon",
-    "pokémon",
-    "pokemon tcg",
-    "pokémon tcg",
-    "pikachu",
-    "charizard",
-    "eevee",
-    "bulbasaur",
-    "charmander",
-    "squirtle",
-    "poké",
-    "poke",
-    "30th anniversary",
-    "30-vuotis",
-    "30 vuotta",
-]
-
-# Tiedosto, johon nähdyt tuotteet tallennetaan.
-DATABASE = "products.sqlite3"
-
-# Kuinka monta uutuussivua käydään läpi.
-MAX_NEW_PRODUCT_PAGES = 10
-
-# Pieni tauko pyyntöjen välillä.
-REQUEST_DELAY = 0.5
-
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 "
-    "(KHTML, like Gecko) "
-    "Chrome/140.0 Safari/537.36"
-)
+# Turvaraja sivutukselle.
+MAX_PAGES = 20
 
 
-# ============================================================
-# HTTP
-# ============================================================
+def normalize_product_url(url):
+    """
+    Muuttaa tuotteen URL:n yhtenäiseen muotoon.
+    Query-parametrit ja #fragmentit poistetaan.
+    """
 
-session = requests.Session()
+    absolute = urljoin(BASE_URL, url)
 
-session.headers.update(
-    {
-        "User-Agent": USER_AGENT,
-        "Accept-Language": "fi-FI,fi;q=0.9,en;q=0.8",
-        "Accept": "text/html,application/xhtml+xml",
-    }
-)
+    parts = urlsplit(absolute)
 
-
-def download_page(url):
-    print(f"Ladataan: {url}")
-
-    response = session.get(
-        url,
-        timeout=30,
+    clean = urlunsplit(
+        (
+            parts.scheme,
+            parts.netloc,
+            parts.path.rstrip("/"),
+            "",
+            "",
+        )
     )
 
-    response.raise_for_status()
-
-    time.sleep(REQUEST_DELAY)
-
-    return response.text
+    return clean
 
 
-# ============================================================
-# TUOTELINKKIEN ETSIMINEN
-# ============================================================
-
-def extract_product_links(html):
+def extract_products(page):
     """
-    Etsii Prisma.fi:n tuotesivuja HTML:stä.
-
-    Tuotesivut näyttävät olevan muotoa:
-        /tuotteet/123456789/...
+    Kerää sivulla näkyvien Prisma-tuotteiden URL:t ja nimet.
     """
-
-    soup = BeautifulSoup(html, "html.parser")
 
     products = {}
 
-    for link in soup.find_all("a", href=True):
+    links = page.locator('a[href*="/tuotteet/"]')
 
-        href = link.get("href", "")
+    count = links.count()
 
-        if "/tuotteet/" not in href:
-            continue
+    for i in range(count):
 
-        title = " ".join(link.stripped_strings).strip()
+        link = links.nth(i)
 
-        if not title:
-            continue
+        try:
+            href = link.get_attribute("href")
 
-        url = urljoin(BASE_URL, href)
+            if not href:
+                continue
 
-        # Poistetaan query-parametrit ja ankkurit.
-        url = url.split("?")[0]
-        url = url.split("#")[0]
+            url = normalize_product_url(href)
 
-        # Varmistetaan, että kyseessä näyttää olevan oikea tuotesivu.
-        if not re.search(r"/tuotteet/\d+", url):
-            continue
+            # Varmistetaan, että kyseessä on tuotesivu.
+            if "/tuotteet/" not in url:
+                continue
 
-        products[url] = title
+            title = link.inner_text().strip()
+
+            # Jos linkin tekstissä ei ole nimeä,
+            # yritetään käyttää aria-labelia.
+            if not title:
+                title = link.get_attribute("aria-label") or ""
+
+            title = " ".join(title.split())
+
+            # Jos sama URL löytyy monta kertaa,
+            # säilytetään paras nimi.
+            if url not in products or len(title) > len(products[url]):
+                products[url] = title
+
+        except Exception as error:
+            print(f"Linkin lukeminen epäonnistui: {error}")
 
     return products
 
 
-# ============================================================
-# YHDEN TUOTESIVUN TEKSTI
-# ============================================================
-
-def get_product_text(url):
+def scroll_page(page):
     """
-    Lataa tuotteen sivun ja palauttaa siitä tekstin.
+    Vierittää sivua alaspäin, jotta mahdollisesti
+    dynaamisesti latautuvat tuotteet tulevat näkyviin.
     """
 
-    try:
-        html = download_page(url)
+    previous_height = 0
 
-    except Exception as error:
-        print(
-            f"Tuotesivun lataus epäonnistui: "
-            f"{url} -> {error}"
-        )
+    for _ in range(15):
 
-        return ""
+        height = page.evaluate("document.body.scrollHeight")
 
-    soup = BeautifulSoup(html, "html.parser")
-
-    # Poistetaan turhia elementtejä.
-    for element in soup(
-        ["script", "style", "noscript"]
-    ):
-        element.decompose()
-
-    text = " ".join(
-        soup.stripped_strings
-    )
-
-    return text
-
-
-# ============================================================
-# RELEVANSSIN TARKISTAMINEN
-# ============================================================
-
-def is_relevant(title, description=""):
-    """
-    Tarkistaa, liittyykö tuote Pokémoniin.
-
-    Käytetään sekä tuotteen nimeä että tuotteen sivun tekstiä.
-    """
-
-    combined = (
-        f"{title} {description}"
-    ).casefold()
-
-    for keyword in KEYWORDS:
-
-        if keyword.casefold() in combined:
-            return True
-
-    return False
-
-
-# ============================================================
-# TIETOKANTA
-# ============================================================
-
-def initialize_database():
-
-    connection = sqlite3.connect(
-        DATABASE
-    )
-
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS products (
-            url TEXT PRIMARY KEY,
-            title TEXT NOT NULL,
-            first_seen TIMESTAMP
-                DEFAULT CURRENT_TIMESTAMP,
-            last_seen TIMESTAMP
-                DEFAULT CURRENT_TIMESTAMP,
-            relevant INTEGER DEFAULT 0
-        )
-        """
-    )
-
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        )
-        """
-    )
-
-    connection.commit()
-
-    return connection
-
-
-# ============================================================
-# TUOTTEIDEN KERÄÄMINEN
-# ============================================================
-
-def crawl_page(url):
-    """
-    Hakee yhden sivun tuotteet.
-    """
-
-    try:
-        html = download_page(url)
-
-    except Exception as error:
-
-        print(
-            f"Sivun lataus epäonnistui: "
-            f"{url}"
-        )
-
-        print(error)
-
-        return {}
-
-    return extract_product_links(html)
-
-
-# ============================================================
-# POKÉMON-BRÄNDI
-# ============================================================
-
-def crawl_pokemon_brand():
-
-    print()
-    print("=== POKÉMON-BRÄNDI ===")
-
-    products = {}
-
-    for page in range(
-        1,
-        MAX_NEW_PRODUCT_PAGES + 1
-    ):
-
-        if page == 1:
-
-            url = POKEMON_BRAND_URL
-
-        else:
-
-            url = (
-                f"{POKEMON_BRAND_URL}"
-                f"?page={page}"
-            )
-
-        found = crawl_page(url)
-
-        if not found:
+        if height == previous_height:
             break
 
-        products.update(found)
+        previous_height = height
 
-    return products
+        page.evaluate(
+            "window.scrollTo(0, document.body.scrollHeight)"
+        )
 
-
-# ============================================================
-# POKÉMON TCG
-# ============================================================
-
-def crawl_pokemon_tcg():
-
-    print()
-    print("=== POKÉMON TCG ===")
-
-    products = {}
-
-    for page in range(
-        1,
-        MAX_NEW_PRODUCT_PAGES + 1
-    ):
-
-        if page == 1:
-
-            url = POKEMON_TCG_URL
-
-        else:
-
-            url = (
-                f"{POKEMON_TCG_URL}"
-                f"?page={page}"
-            )
-
-        found = crawl_page(url)
-
-        if not found:
-            break
-
-        products.update(found)
-
-    return products
+        page.wait_for_timeout(700)
 
 
-# ============================================================
-# UUTUUDET
-# ============================================================
+def collect_current_page(page):
+    """
+    Vierittää sivun ja kerää tuotteet.
+    """
 
-def crawl_new_products():
+    scroll_page(page)
 
-    print()
-    print("=== UUTUUDET ===")
-
-    products = {}
-
-    for page in range(
-        1,
-        MAX_NEW_PRODUCT_PAGES + 1
-    ):
-
-        if page == 1:
-
-            url = NEW_PRODUCTS_URL
-
-        else:
-
-            url = (
-                f"{NEW_PRODUCTS_URL}"
-                f"?page={page}"
-            )
-
-        found = crawl_page(url)
-
-        if not found:
-            break
-
-        products.update(found)
-
-    return products
+    return extract_products(page)
 
 
-# ============================================================
-# KAIKKIEN LÄHTEIDEN YHDISTÄMINEN
-# ============================================================
+def find_next_page(page):
+    """
+    Yrittää löytää sivutuksen Seuraava-painikkeen.
+    """
 
-def collect_products():
-
-    all_products = {}
-
-    sources = [
-        crawl_pokemon_brand(),
-        crawl_pokemon_tcg(),
-        crawl_new_products(),
+    selectors = [
+        'a[rel="next"]',
+        'a[aria-label*="Seuraava"]',
+        'a[aria-label*="seuraava"]',
     ]
 
-    for source in sources:
+    for selector in selectors:
 
-        for url, title in source.items():
+        locator = page.locator(selector)
 
-            all_products[url] = title
+        if locator.count() > 0:
+
+            try:
+                href = locator.first.get_attribute("href")
+
+                if href:
+                    return urljoin(BASE_URL, href)
+
+            except Exception:
+                pass
+
+    # Varavaihtoehto: etsitään linkin tekstistä.
+
+    links = page.locator("a")
+
+    for i in range(links.count()):
+
+        link = links.nth(i)
+
+        try:
+            text = link.inner_text().strip().lower()
+            href = link.get_attribute("href")
+
+            if href and (
+                text == "seuraava"
+                or text == "seuraava sivu"
+            ):
+                return urljoin(BASE_URL, href)
+
+        except Exception:
+            pass
+
+    return None
+
+
+def collect_paginated_products(page):
+    """
+    Kerää kaikki tuotteet nykyiseltä sivulta
+    ja mahdollisilta seuraavilta sivuilta.
+    """
+
+    all_products = {}
+    visited_pages = set()
+
+    for page_number in range(1, MAX_PAGES + 1):
+
+        current_url = page.url
+
+        if current_url in visited_pages:
+            break
+
+        visited_pages.add(current_url)
+
+        print(f"Luetaan sivu {page_number}: {current_url}")
+
+        products = collect_current_page(page)
+
+        print(
+            f"  Tuotteita tällä sivulla: {len(products)}"
+        )
+
+        all_products.update(products)
+
+        next_url = find_next_page(page)
+
+        if not next_url:
+            break
+
+        if next_url in visited_pages:
+            break
+
+        page.goto(
+            next_url,
+            wait_until="domcontentloaded",
+            timeout=60000,
+        )
+
+        page.wait_for_timeout(1000)
 
     return all_products
 
 
-# ============================================================
-# SÄHKÖPOSTI
-# ============================================================
+def collect_brand_products(page):
+    """
+    Kerää Pokémon-brändisivun tuotteet.
+    """
 
-def send_email(products):
+    print("\n=== POKÉMON-BRÄNDISIVU ===")
 
-    smtp_host = os.environ[
-        "SMTP_HOST"
-    ]
-
-    smtp_port = int(
-        os.environ.get(
-            "SMTP_PORT",
-            "465"
-        )
+    page.goto(
+        POKEMON_BRAND_URL,
+        wait_until="domcontentloaded",
+        timeout=60000,
     )
 
-    smtp_user = os.environ[
-        "SMTP_USER"
+    page.wait_for_timeout(1500)
+
+    products = collect_paginated_products(page)
+
+    print(
+        f"Pokémon-brändisivulta löytyi "
+        f"{len(products)} yksilöllistä tuotetta."
+    )
+
+    return products
+
+
+def collect_search_products(page):
+    """
+    Tekee Prisma.fi:n hakukentässä haun sanalla pokemon
+    ja kerää hakutulosten tuotteet.
+    """
+
+    print('\n=== PRISMA-HAKU: "pokemon" ===')
+
+    page.goto(
+        BASE_URL,
+        wait_until="domcontentloaded",
+        timeout=60000,
+    )
+
+    page.wait_for_timeout(1000)
+
+    # Etsitään hakukenttä useammalla tavalla,
+    # jotta pieni muutos sivustossa ei heti riko skriptiä.
+
+    selectors = [
+        'input[type="search"]',
+        'input[placeholder*="Hae"]',
+        'input[aria-label*="Hae"]',
+        'input[placeholder*="hae"]',
     ]
 
-    smtp_password = os.environ[
-        "SMTP_PASSWORD"
-    ]
+    search_box = None
 
-    alert_to = os.environ[
-        "ALERT_TO"
-    ]
+    for selector in selectors:
+
+        locator = page.locator(selector)
+
+        if locator.count() > 0:
+            search_box = locator.first
+            break
+
+    if search_box is None:
+        raise RuntimeError(
+            "Prisman hakukenttää ei löytynyt."
+        )
+
+    search_box.fill(SEARCH_TERM)
+    search_box.press("Enter")
+
+    page.wait_for_load_state(
+        "domcontentloaded",
+        timeout=60000,
+    )
+
+    page.wait_for_timeout(2000)
+
+    print(f"Hakutulossivu: {page.url}")
+
+    products = collect_paginated_products(page)
+
+    print(
+        f'Haulla "{SEARCH_TERM}" löytyi '
+        f"{len(products)} yksilöllistä tuotetta."
+    )
+
+    return products
+
+
+def load_known_products():
+    """
+    Lukee edellisillä ajoilla nähdyt tuotteet.
+    """
+
+    if not KNOWN_PRODUCTS_FILE.exists():
+        return None
+
+    try:
+
+        with KNOWN_PRODUCTS_FILE.open(
+            "r",
+            encoding="utf-8"
+        ) as file:
+
+            data = json.load(file)
+
+        if not isinstance(data, dict):
+            return {}
+
+        return data
+
+    except Exception as error:
+
+        print(
+            f"Vanhojen tuotteiden lukeminen "
+            f"epäonnistui: {error}"
+        )
+
+        return {}
+
+
+def save_known_products(products):
+    """
+    Tallentaa KAIKKI koskaan nähdyt tuotteet.
+
+    Tuotetta ei poisteta historiasta, vaikka se
+    katoaisi myöhemmin Prismasta.
+    """
+
+    with KNOWN_PRODUCTS_FILE.open(
+        "w",
+        encoding="utf-8"
+    ) as file:
+
+        json.dump(
+            products,
+            file,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+
+
+def send_email(new_products):
+    """
+    Lähettää sähköpostin uusista URL:eista.
+    """
+
+    if not new_products:
+        return
+
+    smtp_host = os.environ["SMTP_HOST"]
+    smtp_port = int(os.environ["SMTP_PORT"])
+    smtp_user = os.environ["SMTP_USER"]
+    smtp_password = os.environ["SMTP_PASSWORD"]
+    alert_to = os.environ["ALERT_TO"]
 
     message = EmailMessage()
 
-    message["Subject"] = (
-        "🔔 Prisma Pokémon - uusi tuote!"
-    )
+    if len(new_products) == 1:
+        subject = "Uusi Pokémon-tuote Prisma.fi:ssä"
+    else:
+        subject = (
+            f"{len(new_products)} uutta "
+            f"Pokémon-tuotetta Prisma.fi:ssä"
+        )
 
+    message["Subject"] = subject
     message["From"] = smtp_user
-
     message["To"] = alert_to
 
-    lines = []
+    lines = [
+        "Prisman Pokémon-seuranta löysi uusia tuotteita.",
+        "",
+    ]
 
-    lines.append(
-        "Prisma.fi:stä löytyi "
-        "uusi Pokémoniin liittyvä tuote."
-    )
+    for url, title in sorted(
+        new_products.items(),
+        key=lambda item: item[1].lower(),
+    ):
 
-    lines.append("")
+        name = title or "Nimi ei löytynyt"
 
-    for product in products:
-
-        title = product["title"]
-        url = product["url"]
-
-        lines.append(
-            f"🎴 {title}"
-        )
-
-        lines.append(
-            url
-        )
-
+        lines.append(name)
+        lines.append(url)
         lines.append("")
 
-    message.set_content(
-        "\n".join(lines)
-    )
+    message.set_content("\n".join(lines))
 
-    print()
-    print(
-        "Lähetetään sähköposti..."
-    )
+    with smtplib.SMTP_SSL(
+        smtp_host,
+        smtp_port,
+        timeout=30,
+    ) as server:
 
-    if smtp_port == 465:
-
-        context = (
-            ssl.create_default_context()
+        server.login(
+            smtp_user,
+            smtp_password,
         )
 
-        with smtplib.SMTP_SSL(
-            smtp_host,
-            smtp_port,
-            context=context
-        ) as smtp:
-
-            smtp.login(
-                smtp_user,
-                smtp_password
-            )
-
-            smtp.send_message(
-                message
-            )
-
-    else:
-
-        with smtplib.SMTP(
-            smtp_host,
-            smtp_port
-        ) as smtp:
-
-            smtp.starttls(
-                context=(
-                    ssl.create_default_context()
-                )
-            )
-
-            smtp.login(
-                smtp_user,
-                smtp_password
-            )
-
-            smtp.send_message(
-                message
-            )
+        server.send_message(message)
 
     print(
-        "Sähköposti lähetetty."
+        f"Sähköposti lähetetty. "
+        f"Uusia tuotteita: {len(new_products)}"
     )
 
-
-# ============================================================
-# PÄÄOHJELMA
-# ============================================================
 
 def main():
 
-    print()
-    print("=" * 60)
-    print("PRISMA POKÉMON WATCHER")
-    print("=" * 60)
-    print()
+    print("Prisma Pokémon watcher käynnistyy.")
 
-    database = (
-        initialize_database()
-    )
+    with sync_playwright() as playwright:
 
-    # --------------------------------------------------------
-    # 1. Haetaan tuotteet useasta lähteestä
-    # --------------------------------------------------------
+        browser = playwright.chromium.launch(
+            headless=True
+        )
+
+        page = browser.new_page(
+            locale="fi-FI",
+            viewport={
+                "width": 1440,
+                "height": 1000,
+            },
+        )
+
+        try:
+
+            # 1. Pokemon-haku
+
+            search_products = collect_search_products(page)
+
+            # 2. Pokemon-brändisivu
+
+            brand_products = collect_brand_products(page)
+
+        finally:
+
+            browser.close()
+
+    # Yhdistetään lähteet URL:n perusteella.
+
+    current_products = {}
+
+    current_products.update(search_products)
+    current_products.update(brand_products)
+
+    print("\n=== YHTEENVETO ===")
 
     print(
-        "Haetaan Prisma.fi:n tuotteita..."
+        f'Pokemon-haun tuotteita: '
+        f"{len(search_products)}"
     )
-
-    products = collect_products()
-
-    print()
-    print(
-        f"Kaikkiaan löydettiin "
-        f"{len(products)} tuotetta."
-    )
-
-    # --------------------------------------------------------
-    # 2. Haetaan aikaisemmin nähdyt tuotteet
-    # --------------------------------------------------------
-
-    existing = {}
-
-    rows = database.execute(
-        """
-        SELECT url, title
-        FROM products
-        """
-    ).fetchall()
-
-    for url, title in rows:
-
-        existing[url] = title
 
     print(
-        f"Aikaisemmin tunnettuja tuotteita: "
-        f"{len(existing)}"
+        f"Pokémon-brändisivun tuotteita: "
+        f"{len(brand_products)}"
     )
 
-    # --------------------------------------------------------
-    # 3. Etsitään uudet tuotteet
-    # --------------------------------------------------------
-
-    brand_new_products = []
-
-    for url, title in products.items():
-
-        if url not in existing:
-
-            print()
-            print(
-                "UUSI TUOTE LÖYTYI:"
-            )
-
-            print(title)
-            print(url)
-
-            brand_new_products.append(
-                {
-                    "url": url,
-                    "title": title,
-                }
-            )
-
-    # --------------------------------------------------------
-    # 4. Ensimmäinen ajo
-    # --------------------------------------------------------
-
-    initialized = database.execute(
-        """
-        SELECT value
-        FROM settings
-        WHERE key = 'initialized'
-        """
-    ).fetchone()
-
-    first_run = (
-        initialized is None
+    print(
+        f"Yksilöllisiä URL:eja yhteensä: "
+        f"{len(current_products)}"
     )
 
-    # --------------------------------------------------------
-    # 5. Tutkitaan uudet tuotteet
-    # --------------------------------------------------------
+    # Turvatarkistus.
+    #
+    # Jos sivusto ei latautunut oikein ja saamme vain
+    # muutaman tuotteen, emme halua tallentaa rikkinäistä
+    # tulosta normaaliksi tilanteeksi.
 
-    relevant_new_products = []
+    if len(current_products) < 20:
 
-    for product in brand_new_products:
-
-        title = product["title"]
-        url = product["url"]
-
-        print()
-        print(
-            "Tutkitaan tuotetta:"
+        raise RuntimeError(
+            "Tuotteita löytyi epäilyttävän vähän "
+            f"({len(current_products)}). "
+            "Tallennusta ei tehdä."
         )
 
-        print(title)
+    known_products = load_known_products()
 
-        description = (
-            get_product_text(url)
-        )
+    # Ensimmäinen onnistunut ajo muodostaa lähtötilanteen.
+    # Sähköpostia ei lähetetä kaikista nykyisistä tuotteista.
 
-        relevant = is_relevant(
-            title,
-            description
-        )
-
-        if relevant:
-
-            print(
-                "✓ Pokémon-tuote"
-            )
-
-            product["relevant"] = 1
-
-            relevant_new_products.append(
-                product
-            )
-
-        else:
-
-            print(
-                "✗ Ei tunnistettu "
-                "Pokémon-tuotteeksi"
-            )
-
-            product["relevant"] = 0
-
-        # Tallennetaan tuote.
-        database.execute(
-            """
-            INSERT OR REPLACE INTO products
-            (
-                url,
-                title,
-                relevant
-            )
-            VALUES (?, ?, ?)
-            """,
-            (
-                url,
-                title,
-                product["relevant"],
-            )
-        )
-
-    # --------------------------------------------------------
-    # 6. Päivitetään vanhojen tuotteiden last_seen
-    # --------------------------------------------------------
-
-    for url, title in products.items():
-
-        if url in existing:
-
-            database.execute(
-                """
-                UPDATE products
-                SET
-                    title = ?,
-                    last_seen = CURRENT_TIMESTAMP
-                WHERE url = ?
-                """,
-                (
-                    title,
-                    url,
-                )
-            )
-
-    database.commit()
-
-    # --------------------------------------------------------
-    # 7. Ensimmäinen ajo = vain lähtötilan luonti
-    # --------------------------------------------------------
-
-    if first_run:
-
-        print()
-        print(
-            "=" * 60
-        )
+    if known_products is None:
 
         print(
-            "ENSIMMÄINEN AJO"
+            "\nEnsimmäinen ajo."
+            "\nTallennetaan nykyiset tuotteet lähtötilanteeksi."
         )
+
+        save_known_products(current_products)
 
         print(
-            "Nykyiset tuotteet tallennettiin "
-            "lähtötilaksi."
+            f"Tallennettu {len(current_products)} tuotetta."
         )
-
-        print(
-            "Sähköpostia ei lähetetä "
-            "olemassa olevista tuotteista."
-        )
-
-        database.execute(
-            """
-            INSERT INTO settings(
-                key,
-                value
-            )
-            VALUES(
-                'initialized',
-                '1'
-            )
-            """
-        )
-
-        database.commit()
-
-        database.close()
 
         return
 
-    # --------------------------------------------------------
-    # 8. Lähetetään ilmoitus
-    # --------------------------------------------------------
+    # Verrataan URL:eja, EI tuotemäärää.
 
-    if relevant_new_products:
+    new_products = {
+        url: title
+        for url, title in current_products.items()
+        if url not in known_products
+    }
 
-        print()
-        print(
-            "=" * 60
-        )
-
-        print(
-            f"LÖYTYI "
-            f"{len(relevant_new_products)} "
-            f"UUTTA RELEVANTTIA TUOTETTA!"
-        )
+    if new_products:
 
         print(
-            "=" * 60
+            f"\nUUSIA URL:EJA: {len(new_products)}"
         )
 
-        send_email(
-            relevant_new_products
-        )
+        for url, title in new_products.items():
+
+            print(f"\n{title}")
+            print(url)
+
+        # Lähetetään ilmoitus ennen historian tallentamista.
+        # Jos sähköposti epäonnistuu, ajo epäonnistuu eikä
+        # uusia tuotteita merkitä nähdyiksi.
+
+        send_email(new_products)
 
     else:
 
-        print()
-        print(
-            "Uusia relevantteja "
-            "Pokémon-tuotteita ei löytynyt."
-        )
+        print("\nEi uusia tuote-URL:eja.")
 
-    database.close()
+    # Säilytetään myös tuotteet, jotka ovat poistuneet
+    # nykyisestä valikoimasta. Näin vanhan tuotteen paluu
+    # ei aiheuta turhaa "uusi tuote" -ilmoitusta.
 
-    print()
-    print("Valmis.")
+    known_products.update(current_products)
 
+    save_known_products(known_products)
 
-# ============================================================
-# START
-# ============================================================
+    print(
+        f"\nHistoriassa nyt "
+        f"{len(known_products)} tuotetta."
+    )
+
 
 if __name__ == "__main__":
-
     main()
